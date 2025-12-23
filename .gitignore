@@ -1,0 +1,17 @@
+# --- Секреты и настройки ---
+.env
+.env.txt
+
+# --- Логи и базы данных ---
+*.log
+subscriptions.xlsx
+bot_error.txt
+bot_log.txt
+
+# --- Мусор Python ---
+__pycache__/
+*.py[cod]
+
+# --- Системные файлы ---
+.idea/
+.vscode/

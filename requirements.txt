@@ -1,0 +1,6 @@
+aiogram>=3.0
+requests
+openpyxl
+yadisk
+python-dotenv
+PyYAML
