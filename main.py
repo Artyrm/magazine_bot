@@ -16,7 +16,7 @@ from config import BOT_TOKEN, YANDEX_TOKEN, ADMIN_IDS
 # Импорт обработчиков
 # fsm_engine - наш новый движок с YAML
 # common - технические команды типа /id (если файла нет, удалите эту строку)
-from handlers import fsm_engine, common 
+from handlers import fsm_engine, common, admin_chat
 
 print("✅ Готово.")
 
@@ -75,6 +75,9 @@ async def main():
         # Если вы не создавали common.py, закомментируйте строку ниже
         dp.include_router(common.router)
         
+        # Админский чат (ВАЖНО: До FSM, чтобы перехватывать /send и ответы админов)
+        dp.include_router(admin_chat.router)
+
         # Затем регистрируем основной движок FSM (анкета)
         dp.include_router(fsm_engine.router)
         # ---------------------------

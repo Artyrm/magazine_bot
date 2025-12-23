@@ -34,3 +34,8 @@ if admin_ids_str:
 else:
     # Если переменной нет
     print("ℹ️ ADMIN_IDS не указаны. Бот запущен без администраторов.")
+try:
+    group_id_str = os.getenv("ADMIN_GROUP_ID")
+    ADMIN_GROUP_ID = int(group_id_str) if group_id_str else None
+except ValueError:
+    ADMIN_GROUP_ID = None
