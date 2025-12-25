@@ -4,3 +4,4 @@ openpyxl
 yadisk
 python-dotenv
 PyYAML
+qrcode[pil]

@@ -15,11 +15,14 @@ BOT_TOKEN = get_env_variable("BOT_TOKEN")
 YANDEX_TOKEN = get_env_variable("YANDEX_TOKEN")
 EXCEL_FILE = "subscriptions.xlsx"
 
-# Папка на Яндекс.Диске (начинается со слеша, без слеша в конце)
+# Папка на Яндекс.Диске
 YANDEX_DIR = "/Боты/Бот журнала"
 
-# Полный путь к файлу в облаке
-REMOTE_PATH = f"{YANDEX_DIR}/{EXCEL_FILE}"
+# Имя файла локально
+EXCEL_FILE = "subscriptions.xlsx"
+
+# Полный путь к файлу в облаке (используем то имя, которое вы ввели в новом коде)
+REMOTE_PATH_SUBS = f"{YANDEX_DIR}/{EXCEL_FILE}" 
 
 admin_ids_str = os.getenv("ADMIN_IDS")
 
