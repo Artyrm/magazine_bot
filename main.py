@@ -71,12 +71,13 @@ async def main():
         dp = Dispatcher()
         
         # --- РЕГИСТРАЦИЯ РОУТЕРОВ ---
-        # Сначала регистрируем технические команды (/id)
-        # Если вы не создавали common.py, закомментируйте строку ниже
-        dp.include_router(common.router)
         
         # Админский чат (ВАЖНО: До FSM, чтобы перехватывать /send и ответы админов)
         dp.include_router(admin_chat.router)
+        
+        # Если вы не создавали common.py, закомментируйте строку ниже
+        dp.include_router(common.router)
+
 
         # Затем регистрируем основной движок FSM (анкета)
         dp.include_router(fsm_engine.router)

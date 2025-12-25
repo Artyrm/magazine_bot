@@ -3,16 +3,20 @@ import logging
 from aiogram import Router, types, F, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime
 
 # Импорты конфигурации и сервисов
-from config import ADMIN_IDS
+from config import ADMIN_IDS, ADMIN_GROUP_ID
 from services.sheets import add_subscription
+from services.thread_manager import get_last_msg_id, set_last_msg_id
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+# 1. ЗАЩИТА: Этот роутер работает ТОЛЬКО в личке
+router.message.filter(F.chat.type == "private")
 
 # --- ЗАГРУЗКА КОНФИГА ---
 try:
@@ -24,10 +28,11 @@ except Exception as e:
 
 # --- СОСТОЯНИЯ ---
 class EngineState(StatesGroup):
-    active = State()          # Основной режим работы по меню
-    confirm_forward = State() # Режим ожидания подтверждения отправки
+    active = State()          
+    confirm_forward = State() 
+    in_dialogue = State()     
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- ФУНКЦИИ-ПОМОЩНИКИ ---
 
 def get_node(node_name):
     return FSM_CONFIG["states"].get(node_name)
@@ -40,18 +45,13 @@ def create_kb(buttons_list):
 
 async def execute_action(action_name, message, state: FSMContext):
     """Выполняет бизнес-логику"""
-    if not action_name:
-        return
+    if not action_name: return
     data = await state.get_data()
 
-    if action_name == "save_name":
-        await state.update_data(name=message.text)
-    elif action_name == "save_address":
-        await state.update_data(address=message.text)
-    elif action_name == "save_phone":
-        await state.update_data(phone=message.text)
-    elif action_name == "clear_data":
-        await state.set_data({})
+    if action_name == "save_name": await state.update_data(name=message.text)
+    elif action_name == "save_address": await state.update_data(address=message.text)
+    elif action_name == "save_phone": await state.update_data(phone=message.text)
+    elif action_name == "clear_data": await state.set_data({})
     elif action_name == "submit_to_excel":
         wait_msg = await message.answer("⏳ Сохраняем заявку...")
         row = [
@@ -69,24 +69,57 @@ async def execute_action(action_name, message, state: FSMContext):
             await wait_msg.edit_text(f"⚠️ Ошибка сохранения: {e}")
 
 async def render_state(node_name, message, state: FSMContext):
-    """Рисует текущий экран меню"""
     node = get_node(node_name)
-    if not node:
-        await message.answer(f"Ошибка: состояние '{node_name}' не найдено.")
-        return
+    if not node: return
 
     data = await state.get_data()
-    text_template = node.get("text", "")
-    try:
-        text = text_template.format(**data)
-    except KeyError:
-        text = text_template
-    
+    text = node.get("text", "").format(**data) if data else node.get("text", "")
     kb = create_kb(node.get("keyboard", []))
+    
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
     await state.update_data(current_node=node_name)
 
-# --- ОБРАБОТЧИКИ (HANDLERS) ---
+async def forward_to_admins(message: types.Message, state: FSMContext, is_reply=False):
+    """
+    Стандартная функция пересылки (используется, когда юзер пишет сам).
+    Берет данные из message.from_user.
+    """
+    user = message.from_user
+    username = f"@{user.username}" if user.username else ""
+    data = await state.get_data()
+    current_node = data.get("current_node", "unknown")
+    
+    content_text = message.text or '[Медиафайл]'
+    reply_to_id = get_last_msg_id(user.id) or data.get("last_admin_thread_id")
+
+    header = "🗣 <b>Сообщение от пользователя</b>" if is_reply else "📩 <b>Новое обращение</b>"
+    
+    admin_text = (
+        f"{header}\n"
+        f"👤 {user.full_name} ({username})\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"📍 Этап: {current_node}\n"
+        f"➖➖➖➖➖➖➖\n"
+        f"{content_text}"
+    )
+
+    if ADMIN_GROUP_ID:
+        try:
+            sent_msg = await message.bot.send_message(
+                chat_id=ADMIN_GROUP_ID, 
+                text=admin_text, 
+                parse_mode="HTML",
+                reply_to_message_id=reply_to_id
+            )
+            set_last_msg_id(user.id, sent_msg.message_id)
+            await state.update_data(last_admin_thread_id=sent_msg.message_id)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка отправки в группу: {e}")
+            return False
+    return False
+
+# --- ОБРАБОТЧИКИ ---
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -95,118 +128,140 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await render_state(start_node, message, state)
     await state.set_state(EngineState.active)
 
-# 1. ОБРАБОТЧИК ОСНОВНОГО МЕНЮ И ТЕКСТА
+# Ловушка для потерянных состояний (после перезагрузки)
+@router.message(StateFilter(None))
+async def catch_stateless_message(message: types.Message, state: FSMContext):
+    start_node_name = FSM_CONFIG.get("initial_state", "main_menu")
+    start_node = get_node(start_node_name)
+    if not start_node:
+        await cmd_start(message, state)
+        return
+
+    # Проверяем, нажал ли кнопку меню
+    user_text = message.text
+    is_main_menu_button = any(t.get("trigger") == user_text for t in start_node.get("transitions", []))
+            
+    if is_main_menu_button:
+        await state.set_state(EngineState.active)
+        await state.update_data(current_node=start_node_name)
+        await process_step(message, state)
+    else:
+        await cmd_start(message, state)
+
 @router.message(EngineState.active)
+@router.message(EngineState.in_dialogue)
 async def process_step(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
     data = await state.get_data()
     current_node_name = data.get("current_node")
     node = get_node(current_node_name)
     
     if not node:
-        await message.answer("Ошибка состояния. Нажмите /start")
+        await message.answer("⚠️ Ошибка состояния. Нажмите /start")
         return
 
     user_text = message.text
     transitions = node.get("transitions", [])
-    
     target_node = None
     action_to_do = None
 
-    # Поиск перехода по меню
+    # 1. Проверяем кнопки меню
     for trans in transitions:
-        trigger = trans.get("trigger")
-        if trigger == user_text or trigger == "*":
+        if trans.get("trigger") == user_text:
             target_node = trans.get("dest")
             action_to_do = trans.get("action")
             break
-    
+            
     if target_node:
-        # Если команда найдена - переходим дальше
+        await execute_action(action_to_do, message, state)
+        await render_state(target_node, message, state)
+        await state.set_state(EngineState.active)
+        return
+
+    # 2. Если не кнопка
+    if current_state == EngineState.in_dialogue:
+        success = await forward_to_admins(message, state, is_reply=True)
+        if success:
+            try: await message.react([types.ReactionTypeEmoji(emoji="👀")])
+            except: pass
+        else:
+            await message.answer("⚠️ Ошибка связи с координаторами.")
+        return
+
+    for trans in transitions:
+        if trans.get("trigger") == "*":
+            target_node = trans.get("dest")
+            action_to_do = trans.get("action")
+            break
+            
+    if target_node:
         await execute_action(action_to_do, message, state)
         await render_state(target_node, message, state)
     else:
-        # --- ЛОГИКА "НЕПОНЯТНОГО СООБЩЕНИЯ" ---
-        
-        # 1. Сохраняем текст, который написал юзер
+        # Неизвестная команда -> Предлагаем диалог
         await state.update_data(pending_message_text=message.text)
-        await state.update_data(pending_message_id=message.message_id) # На случай фото/файлов
-
-        # 2. Создаем инлайн-клавиатуру (Да/Нет)
+        
         confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="📨 Отправить координатору", callback_data="fwd_yes"),
-                InlineKeyboardButton(text="❌ Нет, ошибка", callback_data="fwd_no")
+                InlineKeyboardButton(text="❌ Это ошибка", callback_data="fwd_no")
             ]
         ])
 
-        # 3. Спрашиваем
         await message.answer(
             "Я не понял эту команду. 🤔\n"
-            "Хотите переслать это сообщение администратору журнала?",
+            "Хотите отправить это сообщение координатору журнала?",
             reply_markup=confirm_kb
         )
-        
-        # 4. Переключаем состояние (чтобы ждать нажатия кнопки, а не текста)
         await state.set_state(EngineState.confirm_forward)
 
-
-# 2. ОБРАБОТЧИК НАЖАТИЯ КНОПОК "ДА/НЕТ"
+# --- ИСПРАВЛЕННАЯ ОБРАБОТКА КНОПКИ ---
 @router.callback_query(EngineState.confirm_forward, F.data.in_({"fwd_yes", "fwd_no"}))
 async def process_forward_decision(callback: types.CallbackQuery, state: FSMContext):
-    """Обрабатываем решение пользователя"""
-    
     if callback.data == "fwd_no":
-        # Если нажал "Нет"
         await callback.message.edit_text("Действие отменено.")
-    elif callback.data == "fwd_yes":
-        # Если нажал "Да, отправить"
         data = await state.get_data()
-        msg_text = data.get("pending_message_text", "[Нет текста]")
+        await render_state(data.get("current_node", "main_menu"), callback.message, state)
+        await state.set_state(EngineState.active)
+        
+    elif callback.data == "fwd_yes":
+        # 1. Берем данные ЮЗЕРА, а не сообщения бота
+        user = callback.from_user 
+        data = await state.get_data()
+        saved_text = data.get("pending_message_text", "")
         current_node = data.get("current_node", "unknown")
         
-        user = callback.from_user
-        username = f"@{user.username}" if user.username else "без юзернейма"
-        name = user.full_name
-        
-        # Формируем карточку для группы координаторов
-        coord_message = (
-            f"📩 <b>Вопрос от читателя</b>\n"
-            f"👤 {name} ({username})\n"
-            f"🆔 ID: <code>{user.id}</code>\n"  # Тег code позволит кликом копировать ID
+        # 2. Формируем сообщение вручную (не используем forward_to_admins с кривым message)
+        username = f"@{user.username}" if user.username else ""
+        admin_text = (
+            f"📩 <b>Новое обращение</b>\n"
+            f"👤 {user.full_name} ({username})\n"
+            f"🆔 ID: <code>{user.id}</code>\n"
             f"📍 Этап: {current_node}\n"
             f"➖➖➖➖➖➖➖\n"
-            f"{msg_text}"
+            f"{saved_text}"
         )
-        
-        bot = callback.message.bot
-        
-        # Импортируем ID группы
-        from config import ADMIN_GROUP_ID
         
         if ADMIN_GROUP_ID:
             try:
-                # Отправляем В ГРУППУ
-                await bot.send_message(chat_id=ADMIN_GROUP_ID, text=coord_message, parse_mode="HTML")
-                await callback.message.edit_text("✅ Сообщение передано координатору.")
+                # Отправляем в группу
+                sent_msg = await callback.message.bot.send_message(
+                    chat_id=ADMIN_GROUP_ID, 
+                    text=admin_text, 
+                    parse_mode="HTML"
+                )
+                
+                # Сохраняем нить для будущих ответов
+                set_last_msg_id(user.id, sent_msg.message_id)
+                await state.update_data(last_admin_thread_id=sent_msg.message_id)
+                
+                # Включаем режим диалога
+                await state.set_state(EngineState.in_dialogue)
+                await callback.message.edit_text("✅ Сообщение передано. Режим диалога включен: пишите сюда, я всё передам.")
             except Exception as e:
-                logger.error(f"Ошибка отправки в группу: {e}")
-                await callback.message.edit_text("⚠️ Ошибка связи с координаторами.")
+                logger.error(f"Ошибка отправки: {e}")
+                await callback.message.edit_text("⚠️ Ошибка связи.")
         else:
-            await callback.message.edit_text("⚠️ Ошибка настройки: не задана группа координаторов.")    
-
-
-    # В ЛЮБОМ СЛУЧАЕ:
-    # Возвращаем пользователя обратно в меню (в то состояние, где он был)
-    data = await state.get_data()
-    current_node = data.get("current_node", "main_menu")
-    
-    # Снова показываем меню (чтобы кнопки вернулись)
-    # Нам нужно отправить новое сообщение, так как callback - это редактирование старого
-    # Вызываем render_state, но передаем callback.message (он подойдет как Message)
-    await render_state(current_node, callback.message, state)
-    
-    # Возвращаем режим движка
-    await state.set_state(EngineState.active)
-    
-    # Отвечаем телеграму, что кнопка нажата
+            await callback.message.edit_text("⚠️ Ошибка: нет группы координаторов.")
+            
     await callback.answer()
