@@ -8,18 +8,14 @@ from yadisk.exceptions import LockedError
 from config import YANDEX_TOKEN, EXCEL_FILE, YANDEX_DIR, REMOTE_PATH_SUBS
 
 logger = logging.getLogger(__name__)
-
 file_lock = asyncio.Lock()
 
-# Инициализация клиента
 try:
     y = yadisk.YaDisk(token=YANDEX_TOKEN)
 except Exception as e:
-    logger.critical(f"Ошибка инициализации Yadisk: {e}")
     y = None
 
 class CloudUploadError(Exception):
-    """Кастомная ошибка для уведомления админов"""
     pass
 
 def _ensure_remote_dir_exists(client: yadisk.YaDisk, path: str):
@@ -28,112 +24,86 @@ def _ensure_remote_dir_exists(client: yadisk.YaDisk, path: str):
     for part in parts:
         current_path += f"/{part}"
         try:
-            if not client.exists(current_path):
-                client.mkdir(current_path)
-        except Exception:
-            pass
+            if not client.exists(current_path): client.mkdir(current_path)
+        except Exception: pass
 
 def _set_column_widths(ws):
-    """Настраивает красивую ширину колонок"""
-    # Словарь: {Буква: Ширина}
-    widths = {
-        'A': 18, # Дата (2025-12-25 15:00)
-        'B': 15, # User ID
-        'C': 20, # Username
-        'D': 20, # Тип подписки
-        'E': 35, # ФИО (пошире)
-        'F': 50, # Адрес / Способ (самое широкое)
-        'G': 18, # Телефон
-        'H': 25, # Выбранные номера
-        'I': 12  # Согласие (узкое)
-    }
-    
+    widths = {'A': 18, 'B': 15, 'C': 20, 'D': 20, 'E': 35, 'F': 50, 'G': 18, 'H': 25, 'I': 12}
     for col_letter, width in widths.items():
-        try:
-            ws.column_dimensions[col_letter].width = width
-        except Exception:
-            pass
+        try: ws.column_dimensions[col_letter].width = width
+        except Exception: pass
 
 def _update_headers_if_needed(ws, new_headers: list):
     try:
-        # Проверяем заголовки
         current_headers = [cell.value for cell in ws[1]]
-        
-        # Если это новый файл или заголовки изменились
         if current_headers != new_headers:
-            logger.info("📉 Обновляем заголовки и ширину колонок...")
             for col_num, header in enumerate(new_headers, 1):
                 ws.cell(row=1, column=col_num, value=header)
-            
-            # Принудительно применяем ширину
             _set_column_widths(ws)
-            
-    except Exception as e:
-        logger.warning(f"Ошибка обновления структуры Excel: {e}")
+    except Exception: pass
 
 def _save_to_excel_sync(filename: str, remote_path: str, data: list, headers: list):
-    # --- 1. ЛОКАЛЬНАЯ ЗАПИСЬ ---
     if not os.path.exists(filename):
         wb = Workbook()
         ws = wb.active
         ws.append(headers)
-        # Сразу ставим ширину для нового файла
         _set_column_widths(ws)
         wb.save(filename)
-    
     try:
         wb = openpyxl.load_workbook(filename)
         ws = wb.active
-        
-        # Проверяем структуру (и чиним ширину, если сбилась)
         _update_headers_if_needed(ws, headers)
-        
-        # Добавляем данные
         ws.append(data)
         wb.save(filename)
-        logger.info(f"💾 Запись сохранена локально.")
     except PermissionError:
-        logger.error(f"❌ Файл {filename} заблокирован Excel!")
-        raise IOError(f"Файл {filename} открыт другой программой.")
+        raise IOError(f"Файл {filename} открыт.")
 
-    # --- 2. ЗАГРУЗКА В ОБЛАКО ---
-    if not y:
-        return
-
+    if not y: return
     try:
-        if not y.check_token():
-            raise CloudUploadError("Токен Яндекс.Диска невалиден")
-
+        if not y.check_token(): raise CloudUploadError("Invalid Token")
         _ensure_remote_dir_exists(y, YANDEX_DIR)
-        
         try:
             y.upload(filename, remote_path, overwrite=True)
-            logger.info("☁️ Успешная загрузка в облако.")
-        
         except LockedError:
-            logger.warning("⚠️ Файл на Диске заблокирован (423). Пытаемся удалить и перезалить...")
-            try:
-                y.remove(remote_path)
-                import time
-                time.sleep(1) 
-                y.upload(filename, remote_path, overwrite=True)
-                logger.info("☁️ Перезаливка удалась.")
-            except Exception as delete_err:
-                raise CloudUploadError(f"Ресурс заблокирован и не удаляется: {delete_err}")
-
+            y.remove(remote_path)
+            import time; time.sleep(1)
+            y.upload(filename, remote_path, overwrite=True)
     except Exception as e:
-        logger.error(f"❌ Ошибка облака: {e}")
-        if isinstance(e, CloudUploadError):
-            raise e
-        raise CloudUploadError(f"Сбой загрузки: {e}")
+        if isinstance(e, CloudUploadError): raise e
+        raise CloudUploadError(f"Upload fail: {e}")
 
 async def add_subscription(user_data: list):
-    headers = [
-        "Дата", "User ID", "Username", 
-        "Тип подписки", "ФИО", 
-        "Способ получения / Доставка", 
-        "Телефон", "Выбранные номера", 
-        "Согласие ПД"
-    ]
+    headers = ["Дата", "User ID", "Username", "Тип подписки", "ФИО", "Способ получения / Доставка", "Телефон", "Выбранные номера", "Согласие ПД"]
     async with file_lock:
         await asyncio.to_thread(_save_to_excel_sync, EXCEL_FILE, REMOTE_PATH_SUBS, user_data, headers)
+
+def find_last_subscription(user_id: int):
+    """Ищет запись СТРОГО по новой структуре колонок."""
+    if not os.path.exists(EXCEL_FILE):
+        return None
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE, read_only=True)
+        ws = wb.active
+        target_id = str(user_id).strip()
+        found_data = None
+        for row in reversed(list(ws.iter_rows(min_row=2, values_only=True))):
+            if not row or len(row) < 5 or row[1] is None:
+                continue
+            row_id = str(row[1]).strip()
+            if row_id.endswith(".0"): row_id = row_id[:-2]
+            if row_id == target_id:
+                name = row[4]
+                phone = str(row[6]) if len(row) > 6 and row[6] else "Не указан"
+                delivery_full = str(row[5]) if len(row) > 5 and row[5] else ""
+                address = ""
+                if "Адрес:" in delivery_full:
+                    parts = delivery_full.split("Адрес:")
+                    if len(parts) > 1: address = parts[1].strip()
+                if name:
+                    found_data = {"name": str(name), "phone": phone, "address": address}
+                    break
+        wb.close()
+        return found_data
+    except Exception as e:
+        logger.error(f"Ошибка чтения истории: {e}")
+        return None
